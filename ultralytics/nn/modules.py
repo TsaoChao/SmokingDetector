@@ -22,6 +22,7 @@ from torch.cuda import amp
 
 ####
 from ultralytics.yolo.utils.tal import dist2bbox, make_anchors
+torch.use_deterministic_algorithms(True)
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
