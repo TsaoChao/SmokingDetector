@@ -490,6 +490,7 @@ def drop_path_f(x, drop_prob: float = 0., training: bool = False):
     output = x.div(keep_prob) * random_tensor
     return output
 
+
 class DropPath(nn.Module):
     """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
     """
@@ -499,7 +500,41 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path_f(x, self.drop_prob, self.training)
-    
+
+def window_partition(x, window_size: int):
+    """
+    将feature map按照window_size划分成一个个没有重叠的window
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size(M)
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    # permute: [B, H//Mh, Mh, W//Mw, Mw, C] -> [B, H//Mh, W//Mh, Mw, Mw, C]
+    # view: [B, H//Mh, W//Mw, Mh, Mw, C] -> [B*num_windows, Mh, Mw, C]
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+def window_reverse(windows, window_size: int, H: int, W: int):
+    """
+    将一个个window还原成一个feature map
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size(M)
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    # view: [B*num_windows, Mh, Mw, C] -> [B, H//Mh, W//Mw, Mh, Mw, C]
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    # permute: [B, H//Mh, W//Mw, Mh, Mw, C] -> [B, H//Mh, Mh, W//Mw, Mw, C]
+    # view: [B, H//Mh, Mh, W//Mw, Mw, C] -> [B, H, W, C]
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
 
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
@@ -522,7 +557,6 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop2(x)
         return x
-    
 
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
@@ -639,7 +673,76 @@ class SwinTransformerLayer(nn.Module):
         self.norm2 = norm_layer(c)
         mlp_hidden_dim = int(c * mlp_ratio)
         self.mlp = Mlp(in_features=c, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        
+    def create_mask(self, x, H, W):
+        # calculate attention mask for SW-MSA
+        # 保证Hp和Wp是window_size的整数倍
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        # 拥有和feature map一样的通道排列顺序，方便后续window_partition
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # [1, Hp, Wp, 1]
+        h_slices = ( (0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
 
+        mask_windows = window_partition(img_mask, self.window_size)  # [nW, Mh, Mw, 1]
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)  # [nW, Mh*Mw]
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # [nW, 1, Mh*Mw] - [nW, Mh*Mw, 1]
+        # [nW, Mh*Mw, Mh*Mw]
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, torch.tensor(-100.0)).masked_fill(attn_mask == 0, torch.tensor(0.0))
+        return attn_mask
+
+    def forward(self, x):
+        b, c, w, h = x.shape
+        x = x.permute(0, 3, 2, 1).contiguous() # [b,h,w,c]
+
+        attn_mask = self.create_mask(x, h, w) # [nW, Mh*Mw, Mh*Mw]
+        shortcut = x
+        x = self.norm1(x)
+        
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - w % self.window_size) % self.window_size
+        pad_b = (self.window_size - h % self.window_size) % self.window_size
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, hp, wp, _ = x.shape
+
+        if self.shift_size > 0:
+            # print(f"shift size: {self.shift_size}")
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+            attn_mask = None
+        
+        x_windows = window_partition(shifted_x, self.window_size) # [nW*B, Mh, Mw, C]
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, c) # [nW*B, Mh*Mw, C]
+
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # [nW*B, Mh*Mw, C]
+
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)  # [nW*B, Mh, Mw, C]
+        shifted_x = window_reverse(attn_windows, self.window_size, hp, wp)  # [B, H', W', C]
+        
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        
+        if pad_r > 0 or pad_b > 0:
+            # 把前面pad的数据移除掉
+            x = x[:, :h, :w, :].contiguous()
+
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        
+        x = x.permute(0, 3, 2, 1).contiguous()
+        return x # (b, self.c2, w, h)
 
 class SwinTransformerBlock(nn.Module):
     def __init__(self, c1, c2, num_heads, num_layers, window_size=8):
@@ -657,6 +760,7 @@ class SwinTransformerBlock(nn.Module):
             x = self.conv(x)
         x = self.tr(x)
         return x
+
     
 # C3 module with SwinTransformerBlock()  
 class C3STR(C3):
